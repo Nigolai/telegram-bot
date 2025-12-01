@@ -277,7 +277,7 @@ async def main():
     print(f"🌐 Веб-сервер запущен на порту {port}")
 
     # Установка вебхука
-    webhook_url = f"https://Telegram-bot.onrender.com/{TOKEN}"
+    webhook_url = f"https://telegram-bot-ptrv.onrender.com/{TOKEN}"
     await bot.set_webhook(webhook_url, allowed_updates=dp.resolve_used_update_types())
     print(f"🔧 Вебхук установлен: {webhook_url}")
 
