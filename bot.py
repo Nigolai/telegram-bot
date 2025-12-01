@@ -198,31 +198,30 @@ async def check_reminders():
 
         await asyncio.sleep(10)
 
-# === МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы был порт) ===
+# === МИНИ-СЕРВЕР ДЛЯ RENDER (асинхронный) ===
 from aiohttp import web
 
-async def health_check(request):
-    return web.Response(text="OK", status=200)
-
-def start_web_server():
-    app = web.Application()
-    app.router.add_get("/health", health_check)
-    app.router.add_get("/", health_check)
-    port = int(os.getenv("PORT", 8000))
-    web.run_app(app, host="0.0.0.0", port=port)
-
+app = web.Application()
+app.router.add_get("/", lambda _: web.Response(text="OK", status=200))
+app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
 
 # === ЗАПУСК ===
 async def main():
     await init_db()
     asyncio.create_task(check_reminders())
     
-    # Запускаем веб-сервер в фоне
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, start_web_server)
+    # Запуск веб-сервера
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Веб-сервер запущен на порту {port}")
 
+    # Запуск бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
