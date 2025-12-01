@@ -1,60 +1,27 @@
-# bot.py — Напоминалка с PostgreSQL и временем по МСК
+# bot.py — Напоминалка с повторами и удалением (с отладкой для Render)
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
-import asyncpg
+import aiofiles
+import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+import random
+
+# === НАСТРОЙКИ ===
 from dotenv import load_dotenv
-from aiohttp import web
 
-# === ЧАСОВОЙ ПОЯС МСК ===
-MOSCOW_TZ = timezone(timedelta(hours=3))
-
-# === ЗАГРУЗКА ТОКЕНА И БД ===
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not TOKEN:
     raise ValueError("❌ Не установлен BOT_TOKEN")
-if not DATABASE_URL:
-    raise ValueError("❌ Не установлен DATABASE_URL")
 
 # === СОЗДАНИЕ БОТА И ДИСПЕТЧЕРА ===
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
-# === ПОДКЛЮЧЕНИЕ К БАЗЕ ===
-db_pool = None
-
-async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
-    await db_pool.execute('''
-        CREATE TABLE IF NOT EXISTS reminders (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            message TEXT,
-            remind_time TIMESTAMPTZ,
-            repeat TEXT
-        )
-    ''')
-
-# === РАБОТА С НАПОМИНАНИЯМИ ===
-async def save_reminder(user_id, message, remind_time, repeat):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO reminders (user_id, message, remind_time, repeat) VALUES ($1, $2, $3, $4)",
-            user_id, message, remind_time, repeat
-        )
-
-async def delete_reminder_by_id(reminder_id):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM reminders WHERE id = $1", reminder_id)
 
 # === КНОПКИ ===
 def get_main_keyboard():
@@ -66,6 +33,7 @@ def get_main_keyboard():
         resize_keyboard=True
     )
 
+# Типы повторов
 REPEAT_TYPES = {
     "daily": "🔁 Ежедневно",
     "weekly": "📅 Еженедельно",
@@ -73,51 +41,131 @@ REPEAT_TYPES = {
     "none": "🚫 Без повтора"
 }
 
-# === ГЛОБАЛЬНОЕ ХРАНЕНИЕ СОСТОЯНИЙ ===
-user_state = {}  # {user_id: {"step": "...", "data": ...}}
+# === ХРАНЕНИЕ ===
+REMIND_FILE = "reminders.json"
+reminders = []  # [{user_id, message, time, repeat}]
+user_state = {}  # {user_id: {step, data}}
+
+# === ЗАГРУЗКА / СОХРАНЕНИЕ ===
+async def load_reminders():
+    global reminders
+    print("🔧 Попытка загрузить напоминания...")
+    if os.path.exists(REMIND_FILE):
+        try:
+            async with aiofiles.open(REMIND_FILE, "r", encoding="utf-8") as f:
+                content = await f.read()
+                reminders = json.loads(content)
+            print(f"✅ Загружено {len(reminders)} напоминаний")
+        except Exception as e:
+            print(f"❌ Ошибка загрузки: {e}")
+            reminders = []
+    else:
+        print("📝 Файл напоминаний не найден — начнём с пустого списка")
+        reminders = []
+
+async def save_reminders():
+    print(f"💾 Сохраняем {len(reminders)} напоминаний...")
+    try:
+        async with aiofiles.open(REMIND_FILE, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(reminders, ensure_ascii=False, indent=2))
+        print("✅ Напоминания сохранены")
+    except Exception as e:
+        print(f"❌ Не удалось сохранить: {e}")
 
 # === /start ===
 @dp.message(Command("start"))
 async def start(message: types.Message):
+    user_id = message.from_user.id
+    user_state[user_id] = None
+    print(f"👤 Пользователь {user_id} запустил бота")
     await message.answer(
-        "👋 Привет! Я бот-напоминалка.\n"
-        "⏰ Время по МСК",
+        "👋 Привет! Я бот-напоминалка с повторами и удалением.",
         reply_markup=get_main_keyboard()
     )
 
-# === НОВОЕ НАПОМИНАНИЕ ===
+# === КНОПКИ МЕНЮ ===
 @dp.message(lambda m: m.text == "➕ Новое напоминание")
 async def start_remind(message: types.Message):
     user_id = message.from_user.id
     user_state[user_id] = {"step": "waiting_message"}
-    await message.answer("📝 Введи сообщение:")
+    print(f"📝 Пользователь {user_id} начал создание напоминания")
+    await message.answer("📝 Введи сообщение для напоминания:")
+
+@dp.message(lambda m: m.text == "📋 Мои напоминания")
+async def show_reminders(message: types.Message):
+    user_id = message.from_user.id
+    user_rems = [r for r in reminders if r["user_id"] == user_id]
+
+    if not user_rems:
+        await message.answer("📌 У тебя нет активных напоминаний.")
+        return
+
+    # Создаём список с кнопками удаления
+    for i, r in enumerate(user_rems):
+        time_str = datetime.fromisoformat(r["time"]).strftime("%d.%m %H:%M")
+        repeat_text = REPEAT_TYPES.get(r.get("repeat", "none"), "Без повтора")
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{i}")]
+        ])
+
+        await message.answer(
+            f"🔔 Напоминание #{i+1}\n"
+            f"💬 {r['message']}\n"
+            f"⏰ {time_str}\n"
+            f"🔄 {repeat_text}",
+            reply_markup=kb
+        )
+
+# === УДАЛЕНИЕ ЧЕРЕЗ КНОПКУ ===
+@dp.callback_query(lambda c: c.data.startswith("delete_"))
+async def delete_reminder(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_rems = [r for r in reminders if r["user_id"] == user_id]
+    index = int(callback.data.split("_")[1])
+
+    if 0 <= index < len(user_rems):
+        removed = user_rems[index]
+        reminders.remove(removed)
+        await save_reminders()
+        print(f"🗑️ Напоминание удалено: {removed['message']}")
+        await callback.answer("✅ Напоминание удалено!")
+        await callback.message.edit_text("❌ Это напоминание удалено.")
+    else:
+        await callback.answer("❌ Уже удалено.")
 
 # === ОБРАБОТКА СООБЩЕНИЯ ===
-@dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_message")
+@dp.message(lambda m: user_state.get(m.from_user.id, {}).get("step") == "waiting_message")
 async def get_message(message: types.Message):
+    user_id = message.from_user.id
     text = message.text.strip()
     if not text:
         await message.answer("❌ Сообщение не может быть пустым.")
         return
-    user_id = message.from_user.id
+
     user_state[user_id] = {"step": "waiting_time", "message": text}
-    await message.answer("⏰ Введи время (чч:мм), например: 15:30\n"
-                        "📌 Время по МСК")
+    print(f"⏳ Пользователь {user_id} ввёл сообщение: {text}")
+    await message.answer("⏰ Введи время (чч:мм), например: 15:30")
 
 # === ОБРАБОТКА ВРЕМЕНИ ===
-@dp.message(lambda m: (user_state.get(m.from_user.id) or {}).get("step") == "waiting_time")
+@dp.message(lambda m: user_state.get(m.from_user.id, {}).get("step") == "waiting_time")
 async def get_time(message: types.Message):
     user_id = message.from_user.id
+    time_input = message.text.strip()
     try:
-        h, m = map(int, message.text.split(":"))
-        now = datetime.now(MOSCOW_TZ)
-        time = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if time < now:
-            time += timedelta(days=1)
+        hours, minutes = map(int, time_input.split(":"))
+        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+            raise ValueError
+
+        now = datetime.now()
+        remind_time = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+        if remind_time < now:
+            remind_time += timedelta(days=1)
 
         user_state[user_id]["step"] = "waiting_repeat"
-        user_state[user_id]["remind_time"] = time
+        user_state[user_id]["time"] = remind_time.isoformat()
 
+        # Кнопки выбора повтора
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=REPEAT_TYPES["none"], callback_data="repeat_none")],
             [InlineKeyboardButton(text=REPEAT_TYPES["daily"], callback_data="repeat_daily")],
@@ -125,7 +173,8 @@ async def get_time(message: types.Message):
             [InlineKeyboardButton(text=REPEAT_TYPES["monthly"], callback_data="repeat_monthly")]
         ])
         await message.answer("🔁 Выбери, как часто повторять:", reply_markup=kb)
-    except:
+
+    except Exception:
         await message.answer("❌ Неверный формат. Введи чч:мм (например, 09:00)")
 
 # === ВЫБОР ПОВТОРА ===
@@ -137,97 +186,88 @@ async def set_repeat(callback: types.CallbackQuery):
         await callback.answer("❌ Сессия устарела.")
         return
 
-    repeat = callback.data.replace("repeat_", "")
-    await save_reminder(
-        user_id=user_id,
-        message=data["message"],
-        remind_time=data["remind_time"],
-        repeat=repeat
-    )
-    time_str = data["remind_time"].strftime("%d.%m %H:%M")
+    repeat_key = callback.data.replace("repeat_", "")
+    reminder = {
+        "user_id": user_id,
+        "message": data["message"],
+        "time": data["time"],
+        "repeat": repeat_key  # none, daily, weekly, monthly
+    }
+    reminders.append(reminder)
+    await save_reminders()
+
+    time_str = datetime.fromisoformat(data["time"]).strftime("%d.%m %H:%M")
+    repeat_text = REPEAT_TYPES.get(repeat_key, "Без повтора")
+
     await callback.message.edit_text(
         f"✅ Напоминание добавлено!\n"
-        f"💬 {data['message']}\n"
-        f"⏰ {time_str} (МСК)\n"
-        f"🔄 {REPEAT_TYPES.get(repeat, 'Без повтора')}"
+        f"💬 {reminder['message']}\n"
+        f"⏰ {time_str}\n"
+        f"🔄 {repeat_text}"
     )
-    user_state.pop(user_id, None)
+    user_state[user_id] = None
+    print(f"✅ Напоминание добавлено: {reminder['message']} — {time_str}")
     await callback.answer()
-
-# === ПОКАЗАТЬ НАПОМИНАНИЯ ===
-@dp.message(lambda m: m.text == "📋 Мои напоминания")
-async def show_reminders(message: types.Message):
-    user_id = message.from_user.id
-    rows = await db_pool.fetch(
-        "SELECT id, message, remind_time, repeat FROM reminders WHERE user_id = $1 ORDER BY remind_time",
-        user_id
-    )
-    if not rows:
-        await message.answer("📌 У тебя нет активных напоминаний.")
-        return
-
-    for row in rows:
-        time_str = row["remind_time"].astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{row['id']}")]
-        ])
-        await message.answer(
-            f"🔔 {row['message']}\n⏰ {time_str} (МСК)\n🔄 {REPEAT_TYPES.get(row['repeat'], 'Без повтора')}",
-            reply_markup=kb
-        )
-
-# === УДАЛЕНИЕ ЧЕРЕЗ КНОПКУ ===
-@dp.callback_query(lambda c: c.data.startswith("delete_"))
-async def delete_rem(callback: types.CallbackQuery):
-    try:
-        rem_id = int(callback.data.split("_")[1])
-        await delete_reminder_by_id(rem_id)
-        await callback.answer("✅ Напоминание удалено")
-        await callback.message.edit_text("❌ Это напоминание удалено.")
-    except Exception as e:
-        await callback.answer("❌ Уже удалено")
 
 # === ФОН: ПРОВЕРКА И ПОВТОРЫ ===
 async def check_reminders():
+    print("⏱️ Запущена фоновая проверка напоминаний (каждые 10 сек)")
     while True:
-        now = datetime.now(MOSCOW_TZ)
-        rows = await db_pool.fetch("SELECT * FROM reminders WHERE remind_time <= $1", now)
-        for row in rows:
+        now = datetime.now()
+        due_reminders = [r for r in reminders if datetime.fromisoformat(r["time"]) <= now]
+
+        for r in due_reminders:
             try:
-                remind_time = row["remind_time"].astimezone(MOSCOW_TZ)
-                if remind_time <= now:
-                    await bot.send_message(row["user_id"], f"🔔 Напоминание:\n{row['message']}")
+                await bot.send_message(r["user_id"], f"🔔 Напоминание:\n{r['message']}")
+                print(f"📨 Отправлено: {r['message']} (пользователю {r['user_id']})")
             except Exception as e:
-                print(f"Ошибка отправки: {e}")
+                print(f"❌ Ошибка отправки: {e}")
+                reminders.remove(r)
+                await save_reminders()
                 continue
 
-            await delete_reminder_by_id(row["id"])
+            # Удаляем старое
+            reminders.remove(r)
 
-            # Повтор
+            # Если нужен повтор — создаём новое
+            repeat = r.get("repeat", "none")
             new_time = None
-            if row["repeat"] == "daily":
+
+            if repeat == "daily":
                 new_time = now + timedelta(days=1)
-            elif row["repeat"] == "weekly":
+            elif repeat == "weekly":
                 new_time = now + timedelta(weeks=1)
-            elif row["repeat"] == "monthly":
+            elif repeat == "monthly":
                 new_time = now + timedelta(days=30)
 
             if new_time:
-                await save_reminder(row["user_id"], row["message"], new_time, row["repeat"])
+                new_rem = r.copy()
+                new_rem["time"] = new_time.replace(hour=new_time.hour, minute=new_time.minute).isoformat()
+                reminders.append(new_rem)
+                print(f"🔁 Повтор создан: {new_rem['message']} — {new_rem['time']}")
+
+        if due_reminders:
+            await save_reminders()
 
         await asyncio.sleep(10)
 
-# === МИНИ-СЕРВЕР ДЛЯ RENDER (асинхронный) ===
+# === МИНИ-СЕРВЕР ДЛЯ RENDER (чтобы не падало по SIGTERM) ===
+from aiohttp import web
+
 app = web.Application()
 app.router.add_get("/", lambda _: web.Response(text="OK", status=200))
 app.router.add_get("/health", lambda _: web.Response(text="OK", status=200))
 
 # === ЗАПУСК ===
 async def main():
-    await init_db()
+    print("🚀 Запуск бота...")
+    print("🔧 Шаг 1: Загрузка напоминаний...")
+    await load_reminders()
+
+    print("🔧 Шаг 2: Запуск фоновой проверки...")
     asyncio.create_task(check_reminders())
 
-    # Запуск веб-сервера
+    print("🔧 Шаг 3: Запуск веб-сервера для Render...")
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 10000))
@@ -235,7 +275,7 @@ async def main():
     await site.start()
     print(f"🌐 Веб-сервер запущен на порту {port}")
 
-    # Запуск бота
+    print("🚀 Шаг 4: Запуск polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
