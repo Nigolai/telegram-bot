@@ -29,7 +29,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 # === НАСТРОЙКИ КАНАЛА ===
-CHANNEL_ID = -1003308523796  # Из твоих данных
+CHANNEL_ID = -1003364930972  # Из твоих данных
 CHANNEL_URL = "https://t.me/CanalBotYspeh"  # Ссылка для кнопки
 
 # === ПОДКЛЮЧЕНИЕ К БАЗЕ ===
